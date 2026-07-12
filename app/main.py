@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import logging
 import os
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -31,6 +33,8 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
+
+SCRIPT_VERSION = "socks5-paid-proxies-v3-2026-07-12"
 
 # ---------------------------------------------------------------------------
 # Единственная конфигурация сервиса. Пользователей/поездки через сайт добавить
@@ -81,9 +85,20 @@ PASSENGER = {
 DEFAULT_RZD_LOGIN = "DedushkaPopa"
 DEFAULT_RZD_PASSWORD = "DedushkaSO67"
 DEFAULT_TELEGRAM_BOT_TOKEN = "8848029929:AAEJwEh8cQh8PsgCrersdA0gYGArQfT1pW0"
-# Российский HTTP-прокси применяется только к Chromium/сайту РЖД.
+# Купленные российские прокси применяются только к Chromium/сайту РЖД.
 # Telegram API и endpoint FastAPI продолжают работать напрямую через Render.
-DEFAULT_RZD_PROXY_SERVER = "http://193.239.86.180:80"
+# Формат каждой строки: login:password@host:port. Пароли в Telegram и логах
+# никогда не показываются. При недоступности одного адреса бот пробует следующий.
+DEFAULT_RZD_PROXIES = """
+ulpn6uwytr:TLDFMA84m140@94.158.190.227:5501
+zk1n8ffknc:hQh73iWH4W1V@94.158.190.229:5501
+rhmunvo026:Q11NR2eSY5uD@94.158.190.232:5501
+h69v9ywcy8:FGPAE7kPP2nn@94.158.190.242:5501
+pncxu2oes1:yvu90De8dqUi@94.158.190.247:5501
+xta4bvbwzz:Tkb5Y14AhIVm@213.226.101.11:5501
+s288ywjrky:mE6TT9RgnuT2@213.226.101.12:5501
+yehxrbw4ft:Fu61Glk1Hshv@213.226.101.19:5501
+""".strip()
 DEFAULT_ALLOWED_TELEGRAM_IDS = {
     1143838304,
     5317465,
@@ -96,53 +111,81 @@ RZD_PASSWORD = os.getenv("RZD_PASSWORD", DEFAULT_RZD_PASSWORD).strip()
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", DEFAULT_TELEGRAM_BOT_TOKEN
 ).strip()
-RZD_PROXY_SERVER = os.getenv(
-    "RZD_PROXY_SERVER", DEFAULT_RZD_PROXY_SERVER
-).strip()
-RZD_PROXY_USERNAME = os.getenv("RZD_PROXY_USERNAME", "").strip()
-RZD_PROXY_PASSWORD = os.getenv("RZD_PROXY_PASSWORD", "").strip()
+RZD_PROXY_SCHEME = os.getenv("RZD_PROXY_SCHEME", "socks5").strip().lower() or "socks5"
 
 
-def normalize_proxy_server(value: str) -> str:
+def normalize_proxy_server(value: str, scheme: str = "http") -> str:
     value = value.strip()
     if not value:
         return ""
     if "://" not in value:
-        return "http://" + value
+        return f"{scheme}://{value}"
     return value
 
 
-def browser_proxy_config() -> dict[str, str] | None:
-    server = normalize_proxy_server(RZD_PROXY_SERVER)
-    if not server:
-        return None
+def parse_proxy_entry(value: str) -> dict[str, str]:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("Пустая строка прокси")
+
+    credentials = ""
+    endpoint = raw
+    if "@" in raw:
+        credentials, endpoint = raw.rsplit("@", 1)
+
+    server = normalize_proxy_server(endpoint, RZD_PROXY_SCHEME)
     proxy: dict[str, str] = {"server": server}
-    if RZD_PROXY_USERNAME:
-        proxy["username"] = RZD_PROXY_USERNAME
-    if RZD_PROXY_PASSWORD:
-        proxy["password"] = RZD_PROXY_PASSWORD
+    if credentials:
+        if ":" not in credentials:
+            raise ValueError("В прокси указан логин без пароля")
+        username, password = credentials.split(":", 1)
+        proxy["username"] = username
+        proxy["password"] = password
     return proxy
 
 
+def parse_proxy_list(raw: str) -> list[dict[str, str]]:
+    # Поддерживаются переносы строк, запятые и точки с запятой.
+    chunks = [part.strip() for part in re.split(r"[\n,;]+", raw) if part.strip()]
+    result: list[dict[str, str]] = []
+    for chunk in chunks:
+        try:
+            result.append(parse_proxy_entry(chunk))
+        except ValueError as exc:
+            raise RuntimeError(f"Некорректная строка прокси: {chunk!r}: {exc}") from exc
+    if not result:
+        raise RuntimeError("Список российских прокси пуст.")
+    return result
+
+
+def configured_proxy_list() -> list[dict[str, str]]:
+    # Намеренно игнорируем старые переменные Render RZD_PROXY_SERVER,
+    # RZD_PROXY_USERNAME и RZD_PROXY_PASSWORD. Иначе сохранённый в Render
+    # адрес 193.239.86.180:80 перекрывает купленные SOCKS5-прокси из кода.
+    # Для этой сборки всегда используются восемь адресов ниже.
+    return parse_proxy_list(DEFAULT_RZD_PROXIES)
+
+
+RZD_PROXIES = configured_proxy_list()
+
+
+def safe_proxy_label(proxy: dict[str, str] | None) -> str:
+    if not proxy:
+        return "не выбран"
+    server = proxy.get("server", "")
+    for prefix in ("http://", "https://", "socks5://", "socks4://"):
+        server = server.removeprefix(prefix)
+    return server or "не выбран"
+
+
 def proxy_label() -> str:
-    server = normalize_proxy_server(RZD_PROXY_SERVER)
-    return server.removeprefix("http://").removeprefix("https://") if server else "выключен"
-
-
-def friendly_browser_error(exc: Exception) -> str:
-    text = str(exc) or type(exc).__name__
-    upper = text.upper()
-    if "ERR_PROXY_CONNECTION_FAILED" in upper or "ERR_TUNNEL_CONNECTION_FAILED" in upper:
-        return f"Российский прокси {proxy_label()} недоступен или не поддерживает HTTPS CONNECT."
-    if "ERR_CONNECTION_REFUSED" in upper and RZD_PROXY_SERVER:
-        return f"Соединение через российский прокси {proxy_label()} отклонено."
-    if "ERR_TIMED_OUT" in upper or "TIMEOUT" in upper:
-        if RZD_PROXY_SERVER:
-            return f"РЖД не ответил через российский прокси {proxy_label()} вовремя."
-        return "РЖД не ответил вовремя."
-    if "ERR_NAME_NOT_RESOLVED" in upper:
-        return "Не удалось разрешить адрес РЖД через настроенное соединение."
-    return text
+    current_service = globals().get("service")
+    if current_service is not None:
+        try:
+            return current_service.proxy_status_label()
+        except Exception:
+            pass
+    return f"{len(RZD_PROXIES)} адресов, активный ещё не выбран"
 
 
 def parse_allowed_telegram_ids(raw: str | None) -> set[int]:
@@ -268,43 +311,411 @@ async def telegram_photo(path: Path, caption: str) -> None:
                 )
 
 
+class Socks5HttpBridge:
+    """Локальный HTTP-прокси поверх SOCKS5 с логином/паролем.
+
+    Chromium/Playwright умеет SOCKS5 без авторизации, но не передаёт логин и
+    пароль SOCKS5. Поэтому браузер подключается к локальному HTTP-прокси, а этот
+    мост уже выполняет SOCKS5-аутентификацию у купленного прокси.
+    """
+
+    def __init__(self, upstream: dict[str, str]) -> None:
+        self.upstream = dict(upstream)
+        self.server: asyncio.AbstractServer | None = None
+        self.listen_port: int | None = None
+        self.last_error: str | None = None
+
+    @property
+    def upstream_label(self) -> str:
+        return safe_proxy_label(self.upstream)
+
+    async def start(self) -> str:
+        if self.server is not None and self.listen_port is not None:
+            return f"http://127.0.0.1:{self.listen_port}"
+
+        self.server = await asyncio.start_server(
+            self._handle_client,
+            host="127.0.0.1",
+            port=0,
+        )
+        sockets = self.server.sockets or []
+        if not sockets:
+            raise RuntimeError("Не удалось запустить локальный SOCKS5-мост.")
+        self.listen_port = int(sockets[0].getsockname()[1])
+        logger.info(
+            "Локальный HTTP→SOCKS5 мост запущен на 127.0.0.1:%s для %s.",
+            self.listen_port,
+            self.upstream_label,
+        )
+        return f"http://127.0.0.1:{self.listen_port}"
+
+    async def close(self) -> None:
+        if self.server is None:
+            return
+        self.server.close()
+        await self.server.wait_closed()
+        self.server = None
+        self.listen_port = None
+
+    async def _handle_client(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        upstream_writer: asyncio.StreamWriter | None = None
+        try:
+            raw_headers = await asyncio.wait_for(
+                client_reader.readuntil(b"\r\n\r\n"),
+                timeout=20,
+            )
+            if len(raw_headers) > 128 * 1024:
+                raise RuntimeError("Слишком большой заголовок запроса браузера.")
+
+            first_line, *header_lines = raw_headers.split(b"\r\n")
+            parts = first_line.decode("latin-1", errors="replace").split(" ", 2)
+            if len(parts) != 3:
+                raise RuntimeError("Некорректная строка HTTP-запроса браузера.")
+            method, target, version = parts
+
+            if method.upper() == "CONNECT":
+                host, port = self._parse_connect_target(target)
+                upstream_reader, upstream_writer = await self._open_socks5(
+                    host,
+                    port,
+                )
+                client_writer.write(
+                    b"HTTP/1.1 200 Connection Established\r\n"
+                    b"Proxy-Agent: rzd-socks5-bridge\r\n\r\n"
+                )
+                await client_writer.drain()
+            else:
+                parsed = urlsplit(target)
+                if not parsed.hostname:
+                    raise RuntimeError("Браузер передал некорректный URL прокси.")
+                host = parsed.hostname
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+
+                upstream_reader, upstream_writer = await self._open_socks5(
+                    host,
+                    port,
+                )
+                filtered_headers = []
+                for line in header_lines:
+                    lowered = line.lower()
+                    if lowered.startswith(b"proxy-connection:"):
+                        continue
+                    if lowered.startswith(b"proxy-authorization:"):
+                        continue
+                    filtered_headers.append(line)
+                rewritten = (
+                    f"{method} {path} {version}\r\n".encode("latin-1")
+                    + b"\r\n".join(filtered_headers)
+                    + b"\r\n\r\n"
+                )
+                upstream_writer.write(rewritten)
+                await upstream_writer.drain()
+
+            await self._relay_bidirectional(
+                client_reader,
+                client_writer,
+                upstream_reader,
+                upstream_writer,
+            )
+        except asyncio.IncompleteReadError:
+            pass
+        except Exception as exc:
+            self.last_error = self._safe_error(exc)
+            logger.warning(
+                "SOCKS5-мост %s: %s",
+                self.upstream_label,
+                self.last_error,
+            )
+            if not client_writer.is_closing():
+                with suppress(Exception):
+                    client_writer.write(
+                        b"HTTP/1.1 502 Bad Gateway\r\n"
+                        b"Connection: close\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await client_writer.drain()
+        finally:
+            if upstream_writer is not None:
+                upstream_writer.close()
+                with suppress(Exception):
+                    await upstream_writer.wait_closed()
+            client_writer.close()
+            with suppress(Exception):
+                await client_writer.wait_closed()
+
+    @staticmethod
+    def _parse_connect_target(target: str) -> tuple[str, int]:
+        parsed = urlsplit("//" + target)
+        if not parsed.hostname:
+            raise RuntimeError("Некорректный адрес CONNECT.")
+        return parsed.hostname, parsed.port or 443
+
+    async def _open_socks5(
+        self,
+        target_host: str,
+        target_port: int,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        parsed = urlsplit(self.upstream.get("server", ""))
+        proxy_host = parsed.hostname
+        proxy_port = parsed.port
+        if not proxy_host or not proxy_port:
+            raise RuntimeError("Некорректный адрес SOCKS5-прокси.")
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy_host, proxy_port),
+                timeout=20,
+            )
+        except Exception as exc:
+            raise RuntimeError("SOCKS5-сервер не принимает соединение.") from exc
+
+        username = self.upstream.get("username", "")
+        password = self.upstream.get("password", "")
+        methods = b"\x02" if username else b"\x00"
+        writer.write(b"\x05\x01" + methods)
+        await writer.drain()
+
+        try:
+            version, selected_method = await asyncio.wait_for(
+                reader.readexactly(2),
+                timeout=15,
+            )
+        except Exception as exc:
+            writer.close()
+            raise RuntimeError("SOCKS5-сервер не ответил на приветствие.") from exc
+
+        if version != 5 or selected_method == 0xFF:
+            writer.close()
+            raise RuntimeError("SOCKS5-сервер не принял способ авторизации.")
+
+        if selected_method == 0x02:
+            user_bytes = username.encode("utf-8")
+            pass_bytes = password.encode("utf-8")
+            if not user_bytes or len(user_bytes) > 255 or len(pass_bytes) > 255:
+                writer.close()
+                raise RuntimeError("Некорректная длина логина или пароля SOCKS5.")
+            writer.write(
+                b"\x01"
+                + bytes([len(user_bytes)])
+                + user_bytes
+                + bytes([len(pass_bytes)])
+                + pass_bytes
+            )
+            await writer.drain()
+            auth_version, auth_status = await asyncio.wait_for(
+                reader.readexactly(2),
+                timeout=15,
+            )
+            if auth_version != 1 or auth_status != 0:
+                writer.close()
+                raise RuntimeError("SOCKS5-прокси отклонил логин или пароль.")
+        elif selected_method != 0x00:
+            writer.close()
+            raise RuntimeError("SOCKS5-прокси выбрал неподдерживаемую авторизацию.")
+
+        address = self._encode_socks_address(target_host)
+        writer.write(
+            b"\x05\x01\x00"
+            + address
+            + int(target_port).to_bytes(2, "big")
+        )
+        await writer.drain()
+
+        reply = await asyncio.wait_for(reader.readexactly(4), timeout=20)
+        if reply[0] != 5:
+            writer.close()
+            raise RuntimeError("Некорректный ответ SOCKS5-прокси.")
+        if reply[1] != 0:
+            writer.close()
+            descriptions = {
+                1: "общая ошибка",
+                2: "соединение запрещено правилами прокси",
+                3: "сеть недоступна",
+                4: "узел недоступен",
+                5: "соединение отклонено",
+                6: "истёк TTL",
+                7: "команда не поддерживается",
+                8: "тип адреса не поддерживается",
+            }
+            detail = descriptions.get(reply[1], f"код {reply[1]}")
+            raise RuntimeError(f"SOCKS5 не открыл целевой сайт: {detail}.")
+
+        atyp = reply[3]
+        if atyp == 1:
+            await reader.readexactly(4)
+        elif atyp == 3:
+            length = (await reader.readexactly(1))[0]
+            await reader.readexactly(length)
+        elif atyp == 4:
+            await reader.readexactly(16)
+        else:
+            writer.close()
+            raise RuntimeError("SOCKS5 вернул неизвестный тип адреса.")
+        await reader.readexactly(2)
+        return reader, writer
+
+    @staticmethod
+    def _encode_socks_address(host: str) -> bytes:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            encoded = host.encode("idna")
+            if len(encoded) > 255:
+                raise RuntimeError("Слишком длинное доменное имя для SOCKS5.")
+            return b"\x03" + bytes([len(encoded)]) + encoded
+
+        if ip.version == 4:
+            return b"\x01" + ip.packed
+        return b"\x04" + ip.packed
+
+    @staticmethod
+    async def _relay(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            while True:
+                data = await reader.read(64 * 1024)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            with suppress(Exception):
+                writer.write_eof()
+
+    async def _relay_bidirectional(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
+    ) -> None:
+        left = asyncio.create_task(self._relay(client_reader, upstream_writer))
+        right = asyncio.create_task(self._relay(upstream_reader, client_writer))
+        done, pending = await asyncio.wait(
+            {left, right},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+
+    @staticmethod
+    def _safe_error(exc: Exception) -> str:
+        text = str(exc).strip() or type(exc).__name__
+        return text.replace("\n", " ")[:300]
+
+
 class RzdAutomation:
     def __init__(self) -> None:
         self.playwright: Playwright | None = None
         self.context: BrowserContext | None = None
+        self.proxy_bridge: Socks5HttpBridge | None = None
+        self.proxy_index = 0
+        self.context_proxy_index: int | None = None
+
+    @property
+    def active_proxy(self) -> dict[str, str]:
+        return RZD_PROXIES[self.proxy_index]
+
+    def proxy_status_label(self) -> str:
+        return (
+            f"{safe_proxy_label(self.active_proxy)} "
+            f"({self.proxy_index + 1}/{len(RZD_PROXIES)})"
+        )
+
+    async def close_context(self) -> None:
+        if self.context is not None:
+            try:
+                await self.context.close()
+            finally:
+                self.context = None
+                self.context_proxy_index = None
+        if self.proxy_bridge is not None:
+            try:
+                await self.proxy_bridge.close()
+            finally:
+                self.proxy_bridge = None
 
     async def start(self) -> None:
-        if self.context is not None:
+        if (
+            self.context is not None
+            and self.context_proxy_index == self.proxy_index
+        ):
             return
+
+        if self.context is not None:
+            await self.close_context()
+
         PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        self.playwright = await async_playwright().start()
+        if self.playwright is None:
+            self.playwright = await async_playwright().start()
+
+        assert self.playwright is not None
+        logger.info(
+            "Запуск Chromium через прокси %s (%s/%s).",
+            safe_proxy_label(self.active_proxy),
+            self.proxy_index + 1,
+            len(RZD_PROXIES),
+        )
+        # Playwright/Chromium не умеет SOCKS5-аутентификацию напрямую.
+        # Для SOCKS5 с логином и паролем поднимаем локальный HTTP→SOCKS5 мост.
+        browser_proxy = dict(self.active_proxy)
+        if browser_proxy.get("server", "").lower().startswith("socks5://"):
+            self.proxy_bridge = Socks5HttpBridge(browser_proxy)
+            local_proxy = await self.proxy_bridge.start()
+            browser_proxy = {"server": local_proxy}
+
         # Persistent context хранит cookies/localStorage в течение жизни Render-
         # процесса. После сна/redeploy /tmp исчезает, поэтому вход выполнится снова.
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=HEADLESS,
-            proxy=browser_proxy_config(),
-            locale="ru-RU",
-            timezone_id=APP_TIMEZONE,
-            viewport={"width": 1440, "height": 1000},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+        try:
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=HEADLESS,
+                proxy=browser_proxy,
+                locale="ru-RU",
+                timezone_id=APP_TIMEZONE,
+                viewport={"width": 1440, "height": 1000},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                ),
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+        except Exception:
+            if self.proxy_bridge is not None:
+                await self.proxy_bridge.close()
+                self.proxy_bridge = None
+            raise
+        self.context_proxy_index = self.proxy_index
         self.context.set_default_timeout(15_000)
 
+    async def select_proxy(self, index: int) -> None:
+        normalized = index % len(RZD_PROXIES)
+        if normalized == self.proxy_index and self.context is not None:
+            return
+        await self.close_context()
+        self.proxy_index = normalized
+        await self.start()
+
     async def close(self) -> None:
-        if self.context is not None:
-            await self.context.close()
-            self.context = None
+        await self.close_context()
         if self.playwright is not None:
             await self.playwright.stop()
             self.playwright = None
@@ -316,6 +727,71 @@ class RzdAutomation:
         page = await self.context.new_page()
         page.set_default_navigation_timeout(75_000)
         return page
+
+    def friendly_browser_error(self, exc: Exception) -> str:
+        text = str(exc) or type(exc).__name__
+        upper = text.upper()
+        label = self.proxy_status_label()
+        bridge_error = None
+        if self.proxy_bridge is not None:
+            bridge_error = self.proxy_bridge.last_error
+        if (
+            "ERR_PROXY_CONNECTION_FAILED" in upper
+            or "ERR_TUNNEL_CONNECTION_FAILED" in upper
+            or "ERR_SOCKS_CONNECTION_FAILED" in upper
+        ):
+            if bridge_error:
+                return f"SOCKS5-прокси {label}: {bridge_error}"
+            return f"SOCKS5-прокси {label} недоступен."
+        if "ERR_CONNECTION_REFUSED" in upper:
+            return f"Соединение через SOCKS5-прокси {label} отклонено."
+        if "ERR_TIMED_OUT" in upper or "TIMEOUT" in upper:
+            return f"РЖД не ответил через SOCKS5-прокси {label} вовремя."
+        if "ERR_NAME_NOT_RESOLVED" in upper:
+            return f"Прокси {label} не смог разрешить адрес РЖД."
+        if "407" in upper or "PROXY AUTHENTICATION" in upper:
+            return f"SOCKS5-прокси {label} отклонил логин или пароль."
+        return text
+
+    async def page_through_working_proxy(self) -> Page:
+        """Пробует все купленные прокси до первого, открывающего РЖД.
+
+        Переключение выполняется только до начала оформления. После успешной
+        проверки один и тот же IP используется для всей авторизации и заказа.
+        """
+        start_index = self.proxy_index
+        failures: list[str] = []
+
+        for offset in range(len(RZD_PROXIES)):
+            index = (start_index + offset) % len(RZD_PROXIES)
+            page: Page | None = None
+            try:
+                await self.select_proxy(index)
+                page = await self.page()
+                await page.goto(
+                    PORTAL_HOME,
+                    wait_until="domcontentloaded",
+                    timeout=45_000,
+                )
+                await page.wait_for_timeout(1200)
+                logger.info("Прокси %s отвечает и открывает РЖД.", self.proxy_status_label())
+                return page
+            except Exception as exc:
+                message = self.friendly_browser_error(exc)
+                failures.append(f"{safe_proxy_label(self.active_proxy)}: {message}")
+                logger.warning("Прокси не прошёл проверку: %s", message)
+                if page is not None and not page.is_closed():
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                await self.close_context()
+
+        compact = "; ".join(failures[-3:])
+        raise RuntimeError(
+            f"Ни один из {len(RZD_PROXIES)} российских прокси не открыл РЖД. "
+            f"Последние ошибки: {compact}"
+        )
 
     async def screenshot(self, page: Page, name: str) -> Path | None:
         """Сохраняет диагностический экран, но никогда не ломает сценарий.
@@ -445,8 +921,11 @@ class RzdAutomation:
 
     async def login_once(self, page: Page) -> None:
         # Авторизация выполняется на основном портале. После неё cookie-сессия
-        # используется билетным приложением ticket.rzd.ru.
-        await page.goto(PORTAL_HOME, wait_until="domcontentloaded")
+        # используется билетным приложением ticket.rzd.ru. Страница уже могла
+        # быть открыта во время проверки прокси — тогда лишний второй переход
+        # не делаем.
+        if "rzd.ru" not in page.url.lower():
+            await page.goto(PORTAL_HOME, wait_until="domcontentloaded")
         await self.wait_app(page, 3000)
         if await self.is_logged_in(page):
             return
@@ -1047,9 +1526,13 @@ class RzdAutomation:
         raise RuntimeError("РЖД не подтвердил создание заказа.")
 
     async def book_round_trip(self) -> tuple[str, Path | None]:
-        page = await self.page()
-        stage = "открытие браузера"
+        page: Page | None = None
+        stage = "проверка российских прокси"
         try:
+            # До начала оформления перебираем купленные прокси. После первого
+            # успешного соединения IP больше не меняется до завершения заказа.
+            page = await self.page_through_working_proxy()
+
             # Вход делается только при отсутствии активной сессии.
             stage = "авторизация на РЖД"
             await self.login_once(page)
@@ -1099,22 +1582,35 @@ class RzdAutomation:
                 "Заказ создан: Владивосток → Хабаровск-1, 25.07 поезд 005Э, "
                 "вагон 5, место 35; Хабаровск-1 → Владивосток, "
                 "29.07 поезд 006Э 19:40, купе, вагон 7, место 35. "
-                "Оплата не выполнялась.",
+                f"Прокси: {self.proxy_status_label()}. Оплата не выполнялась.",
                 shot,
             )
         except PlaywrightTimeoutError as exc:
-            shot = await self.screenshot(page, "timeout")
-            error = RuntimeError(f"Этап «{stage}»: {friendly_browser_error(exc)}")
+            shot = (
+                await self.screenshot(page, "timeout")
+                if page is not None and not page.is_closed()
+                else None
+            )
+            error = RuntimeError(
+                f"Этап «{stage}»: {self.friendly_browser_error(exc)}"
+            )
             setattr(error, "screenshot", shot)
             raise error from exc
         except Exception as exc:
-            shot = await self.screenshot(page, "booking_error")
-            original = friendly_browser_error(exc)
+            shot = (
+                await self.screenshot(page, "booking_error")
+                if page is not None and not page.is_closed()
+                else None
+            )
+            # Собственные понятные RuntimeError не заменяем сырым сообщением
+            # Playwright. Сетевые исключения переводим в человекочитаемый вид.
+            original = str(exc) if isinstance(exc, RuntimeError) else self.friendly_browser_error(exc)
             error = RuntimeError(f"Этап «{stage}»: {original}")
             setattr(error, "screenshot", shot)
             raise error from exc
         finally:
-            await page.close()
+            if page is not None and not page.is_closed():
+                await page.close()
 
 
 async def run_booking(reason: str = "scheduler") -> None:
@@ -1263,6 +1759,7 @@ def status_text() -> str:
     state = state_labels.get(str(status.get("state")), str(status.get("state")))
     return (
         "📊 Статус РЖД-бота\n\n"
+        f"Версия: {SCRIPT_VERSION}\n"
         f"Состояние: {state}\n"
         f"Автозапуск: {'включён' if enabled else 'на паузе'}\n"
         f"Интервал: {CHECK_INTERVAL_HOURS} ч.\n"
@@ -1278,6 +1775,7 @@ def status_text() -> str:
 def config_text() -> str:
     return (
         "🧾 Фиксированный заказ\n\n"
+        f"Версия: {SCRIPT_VERSION}\n"
         "Туда: Владивосток → Хабаровск-1\n"
         "Дата: 25.07.2026\n"
         "Поезд: 005Э\n"
@@ -1330,8 +1828,10 @@ async def bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await send_menu(
         update,
-        "🚆 РЖД-бот запущен. Он автоматически повторяет заданное оформление раз в "
-        f"{CHECK_INTERVAL_HOURS} часа и присылает результат сюда.",
+        f"🚆 РЖД-бот запущен. Версия: {SCRIPT_VERSION}. "
+        "Используются 8 купленных SOCKS5-прокси. "
+        "Автоматическое оформление выполняется раз в "
+        f"{CHECK_INTERVAL_HOURS} часа.",
     )
 
 
@@ -1509,6 +2009,21 @@ async def stop_telegram_bot(application: Application | None) -> None:
 async def lifespan(app: FastAPI):
     global service, telegram_bot
     require_configuration()
+    stale_proxy_env = [
+        name for name in (
+            "RZD_PROXY_SERVER",
+            "RZD_PROXY_USERNAME",
+            "RZD_PROXY_PASSWORD",
+            "RZD_PROXIES",
+        )
+        if os.getenv(name)
+    ]
+    if stale_proxy_env:
+        logger.warning(
+            "Игнорируются старые proxy env-переменные Render: %s",
+            ", ".join(stale_proxy_env),
+        )
+    logger.info("Запущена версия %s с %s SOCKS5-прокси.", SCRIPT_VERSION, len(RZD_PROXIES))
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     service = RzdAutomation()
     await service.start()
@@ -1532,7 +2047,7 @@ async def lifespan(app: FastAPI):
     status.update(
         {
             "state": "ready",
-            "message": "Сервис запущен.",
+            "message": f"Сервис запущен: {SCRIPT_VERSION}.",
             "next_due_at": iso(
                 utc_now()
                 if RUN_ON_STARTUP
@@ -1541,7 +2056,8 @@ async def lifespan(app: FastAPI):
         }
     )
     await telegram_text(
-        f"🟢 РЖД-сервис запущен. Один заказ, один пассажир, интервал {CHECK_INTERVAL_HOURS} ч."
+        f"🟢 РЖД-сервис запущен. Версия {SCRIPT_VERSION}. "
+        f"Прокси: 8 SOCKS5, интервал {CHECK_INTERVAL_HOURS} ч."
     )
     try:
         yield
@@ -1577,3 +2093,4 @@ async def health(background_tasks: BackgroundTasks) -> JSONResponse:
     if is_due() and not run_lock.locked():
         background_tasks.add_task(run_booking, "health wake-up")
     return JSONResponse({"ok": True, "state": status["state"]})
+
