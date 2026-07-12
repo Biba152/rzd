@@ -34,7 +34,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-SCRIPT_VERSION = "socks5-paid-proxies-v3-2026-07-12"
+SCRIPT_VERSION = "socks5-paid-proxies-v4-rzd-widget-selectors-2026-07-12"
 
 # ---------------------------------------------------------------------------
 # Единственная конфигурация сервиса. Пользователей/поездки через сайт добавить
@@ -998,36 +998,84 @@ class RzdAutomation:
         return re.compile(escaped, re.I)
 
     async def fill_station(self, page: Page, direction: str, value: str) -> bool:
+        # В актуальном Angular-виджете РЖД у полей нет placeholder/name,
+        # зато есть стабильные aria-label:
+        #   «Изменить станцию отправления.»
+        #   «Изменить станцию назначения.»
         if direction == "from":
-            label = re.compile(r"Откуда|Станция отправления|Пункт отправления", re.I)
+            exact_aria = "Изменить станцию отправления."
+            label = re.compile(
+                r"Изменить станцию отправления|Откуда|Станци[яю] отправления|Пункт отправления",
+                re.I,
+            )
             css = (
+                'input[aria-label="Изменить станцию отправления."], '
+                'input[aria-label*="станцию отправления" i], '
                 'input[placeholder*="Откуда" i], input[placeholder*="отправ" i], '
                 'input[name*="from" i], input[data-test-id*="from" i]'
             )
         else:
-            label = re.compile(r"Куда|Станция прибытия|Пункт назначения", re.I)
+            exact_aria = "Изменить станцию назначения."
+            label = re.compile(
+                r"Изменить станцию назначения|Куда|Станци[яю] (?:прибытия|назначения)|Пункт назначения",
+                re.I,
+            )
             css = (
+                'input[aria-label="Изменить станцию назначения."], '
+                'input[aria-label*="станцию назначения" i], '
                 'input[placeholder*="Куда" i], input[placeholder*="прибыт" i], '
                 'input[name*="to" i], input[data-test-id*="to" i]'
             )
 
         for frame in page.frames:
+            # Сначала ждём точный селектор, присланный из DevTools. На главном
+            # frame даём виджету больше времени, потому что он подгружается после
+            # основной HTML-страницы.
+            exact = frame.locator(f'input[aria-label="{exact_aria}"]')
+            try:
+                await exact.first.wait_for(
+                    state="visible",
+                    timeout=15_000 if frame == page.main_frame else 2_500,
+                )
+            except Exception:
+                pass
+
             field = await self.first_visible(
                 [
+                    exact,
                     frame.get_by_label(label),
+                    frame.get_by_role("combobox", name=label),
                     frame.get_by_role("textbox", name=label),
                     frame.locator(css),
                 ]
             )
             if field is None:
                 continue
+
             try:
+                await field.scroll_into_view_if_needed()
                 await field.click()
-                await field.fill(value)
-                await page.wait_for_timeout(1100)
+                await field.fill("")
+                # type(), а не только fill(): Angular-автокомплит РЖД надёжнее
+                # реагирует на последовательность клавиатурных input-событий.
+                await field.type(value, delay=55)
+                await page.wait_for_timeout(1_300)
 
                 pattern = self.station_pattern(value)
-                selected = await self.click_first(
+                option_locators: list[Locator] = []
+                controls = (await field.get_attribute("aria-controls") or "").strip()
+                if controls:
+                    option_locators.extend(
+                        [
+                            frame.locator(f'#{controls} [role="option"]').filter(
+                                has_text=pattern
+                            ),
+                            frame.locator(f'#{controls} li').filter(has_text=pattern),
+                            frame.locator(f'#{controls} > *').filter(has_text=pattern),
+                        ]
+                    )
+
+                option_locators.extend(
                     [
                         frame.get_by_role("option", name=pattern),
                         frame.locator('[role="listbox"] [role="option"]').filter(
@@ -1039,14 +1087,32 @@ class RzdAutomation:
                         ).filter(has_text=pattern),
                     ]
                 )
+
+                selected = await self.click_first(option_locators)
                 if not selected:
-                    # Если подсказка не имеет ARIA-разметки, выбираем первую
-                    # клавишами — виджет РЖД обычно принимает ArrowDown + Enter.
+                    # Резерв для списка без текста/ARIA: первый вариант обычно
+                    # является точным совпадением введённой станции.
+                    if controls:
+                        selected = await self.click_first(
+                            [
+                                frame.locator(f'#{controls} [role="option"]').first,
+                                frame.locator(f'#{controls} li').first,
+                                frame.locator(f'#{controls} > *').first,
+                            ]
+                        )
+                if not selected:
                     await field.press("ArrowDown")
                     await field.press("Enter")
-                await page.wait_for_timeout(450)
+
+                await page.wait_for_timeout(650)
                 return True
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Не удалось заполнить поле станции %s в frame %s: %s",
+                    direction,
+                    frame.url,
+                    exc,
+                )
                 continue
         return False
 
@@ -1089,6 +1155,116 @@ class RzdAutomation:
                 await page.wait_for_timeout(700)
                 return
 
+    @staticmethod
+    def calendar_date_pattern(iso_value: str) -> re.Pattern[str]:
+        dt = datetime.strptime(iso_value, "%Y-%m-%d")
+        months = {
+            1: "января",
+            2: "февраля",
+            3: "марта",
+            4: "апреля",
+            5: "мая",
+            6: "июня",
+            7: "июля",
+            8: "августа",
+            9: "сентября",
+            10: "октября",
+            11: "ноября",
+            12: "декабря",
+        }
+        month_word = months[dt.month]
+        return re.compile(
+            rf"(?:\b{dt.day}\s+{month_word}(?:\s+{dt.year})?\b|"
+            rf"\b{dt.day:02d}[./-]{dt.month:02d}[./-]{dt.year}\b|"
+            rf"\b{dt.year}[./-]{dt.month:02d}[./-]{dt.day:02d}\b)",
+            re.I,
+        )
+
+    async def open_date_placeholder(self, page: Page, title: str):
+        exact = re.compile(rf"^\s*{re.escape(title)}\s*$", re.I)
+        for frame in page.frames:
+            placeholder = await self.first_visible(
+                [
+                    frame.locator("span.ui-kit-input-placeholder").filter(
+                        has_text=exact
+                    ),
+                    frame.locator(
+                        "div.ui-kit-input-text-container"
+                    ).filter(has_text=exact),
+                    frame.get_by_text(exact, exact=True),
+                ]
+            )
+            if placeholder is None:
+                continue
+            try:
+                # Кликаем именно контейнер, а не декоративный span.
+                container = placeholder.locator(
+                    "xpath=ancestor::div[contains(@class,'ui-kit-input-text-container')][1]"
+                )
+                target = container.first if await container.count() else placeholder
+                await target.scroll_into_view_if_needed()
+                await target.click()
+                await page.wait_for_timeout(700)
+                return frame
+            except Exception:
+                try:
+                    await placeholder.click(force=True)
+                    await page.wait_for_timeout(700)
+                    return frame
+                except Exception:
+                    continue
+        return None
+
+    async def select_calendar_day(self, page: Page, frame, iso_value: str) -> bool:
+        dt = datetime.strptime(iso_value, "%Y-%m-%d")
+        full_date = self.calendar_date_pattern(iso_value)
+        exact_day = re.compile(rf"^\s*{dt.day}\s*$")
+
+        # Сначала ищем доступное имя целой даты — это самый безопасный способ,
+        # поскольку в календаре могут одновременно показываться соседние месяцы.
+        candidates: list[Locator] = [
+            frame.get_by_role("button", name=full_date),
+            frame.get_by_role("gridcell", name=full_date),
+            frame.locator("[aria-label]").filter(has_text=full_date),
+        ]
+
+        calendar = await self.first_visible(
+            [
+                frame.get_by_role("dialog"),
+                frame.locator('[class*="calendar" i]'),
+                frame.locator('[class*="datepicker" i]'),
+                frame.locator('[role="grid"]'),
+            ]
+        )
+        if calendar is not None:
+            candidates.extend(
+                [
+                    calendar.get_by_role("button", name=full_date),
+                    calendar.get_by_role("gridcell", name=full_date),
+                    calendar.locator("button").filter(has_text=exact_day),
+                    calendar.locator('[role="gridcell"]').filter(has_text=exact_day),
+                    calendar.get_by_text(exact_day, exact=True),
+                ]
+            )
+
+        # Последний резерв ограничен только элементами внутри календаря/диалога,
+        # чтобы случайно не нажать число 25/29 в другом блоке страницы.
+        candidates.extend(
+            [
+                frame.locator(
+                    '[class*="calendar" i] button, '
+                    '[class*="datepicker" i] button, '
+                    '[role="dialog"] button, [role="grid"] button, '
+                    '[role="dialog"] [role="gridcell"], [role="grid"] [role="gridcell"]'
+                ).filter(has_text=exact_day),
+            ]
+        )
+
+        clicked = await self.click_first(candidates)
+        if clicked:
+            await page.wait_for_timeout(650)
+        return clicked
+
     async def fill_trip_dates(self, page: Page) -> bool:
         await self.ensure_round_trip_mode(page)
         outbound_label = re.compile(
@@ -1098,6 +1274,7 @@ class RzdAutomation:
             r"Обратно|Дата возвращения|Дата обратной поездки|Возвращение", re.I
         )
 
+        # Вариант 1: обычные input, если РЖД снова вернёт старую разметку.
         for frame in page.frames:
             outbound = await self.first_visible(
                 [
@@ -1129,7 +1306,28 @@ class RzdAutomation:
                 if first_ok and second_ok:
                     return True
 
-        # Резерв: в виджете даты могут быть двумя безымянными полями подряд.
+        # Вариант 2: актуальный Angular-виджет. В нём «Туда» и «Обратно» —
+        # span.ui-kit-input-placeholder внутри кликабельного div.
+        outbound_frame = await self.open_date_placeholder(page, "Туда")
+        if outbound_frame is not None:
+            first_ok = await self.select_calendar_day(
+                page, outbound_frame, OUTBOUND["date_iso"]
+            )
+            if first_ok:
+                # Иногда после выбора даты «Туда» календарь сразу ждёт дату
+                # обратно. Сначала пытаемся выбрать 29-е без повторного клика.
+                if await self.select_calendar_day(
+                    page, outbound_frame, RETURN["date_iso"]
+                ):
+                    return True
+
+                return_frame = await self.open_date_placeholder(page, "Обратно")
+                if return_frame is not None and await self.select_calendar_day(
+                    page, return_frame, RETURN["date_iso"]
+                ):
+                    return True
+
+        # Резерв: две безымянные даты подряд.
         for frame in page.frames:
             date_inputs = frame.locator(
                 'input[type="date"], input[placeholder*="дд.мм" i], '
