@@ -1577,4 +1577,3 @@ async def health(background_tasks: BackgroundTasks) -> JSONResponse:
     if is_due() and not run_lock.locked():
         background_tasks.add_task(run_booking, "health wake-up")
     return JSONResponse({"ok": True, "state": status["state"]})
-
