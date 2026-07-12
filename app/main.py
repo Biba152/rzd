@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -80,6 +81,9 @@ PASSENGER = {
 DEFAULT_RZD_LOGIN = "DedushkaPopa"
 DEFAULT_RZD_PASSWORD = "DedushkaSO67"
 DEFAULT_TELEGRAM_BOT_TOKEN = "8848029929:AAEJwEh8cQh8PsgCrersdA0gYGArQfT1pW0"
+# Российский HTTP-прокси применяется только к Chromium/сайту РЖД.
+# Telegram API и endpoint FastAPI продолжают работать напрямую через Render.
+DEFAULT_RZD_PROXY_SERVER = "http://193.239.86.180:80"
 DEFAULT_ALLOWED_TELEGRAM_IDS = {
     1143838304,
     5317465,
@@ -92,6 +96,53 @@ RZD_PASSWORD = os.getenv("RZD_PASSWORD", DEFAULT_RZD_PASSWORD).strip()
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", DEFAULT_TELEGRAM_BOT_TOKEN
 ).strip()
+RZD_PROXY_SERVER = os.getenv(
+    "RZD_PROXY_SERVER", DEFAULT_RZD_PROXY_SERVER
+).strip()
+RZD_PROXY_USERNAME = os.getenv("RZD_PROXY_USERNAME", "").strip()
+RZD_PROXY_PASSWORD = os.getenv("RZD_PROXY_PASSWORD", "").strip()
+
+
+def normalize_proxy_server(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        return "http://" + value
+    return value
+
+
+def browser_proxy_config() -> dict[str, str] | None:
+    server = normalize_proxy_server(RZD_PROXY_SERVER)
+    if not server:
+        return None
+    proxy: dict[str, str] = {"server": server}
+    if RZD_PROXY_USERNAME:
+        proxy["username"] = RZD_PROXY_USERNAME
+    if RZD_PROXY_PASSWORD:
+        proxy["password"] = RZD_PROXY_PASSWORD
+    return proxy
+
+
+def proxy_label() -> str:
+    server = normalize_proxy_server(RZD_PROXY_SERVER)
+    return server.removeprefix("http://").removeprefix("https://") if server else "выключен"
+
+
+def friendly_browser_error(exc: Exception) -> str:
+    text = str(exc) or type(exc).__name__
+    upper = text.upper()
+    if "ERR_PROXY_CONNECTION_FAILED" in upper or "ERR_TUNNEL_CONNECTION_FAILED" in upper:
+        return f"Российский прокси {proxy_label()} недоступен или не поддерживает HTTPS CONNECT."
+    if "ERR_CONNECTION_REFUSED" in upper and RZD_PROXY_SERVER:
+        return f"Соединение через российский прокси {proxy_label()} отклонено."
+    if "ERR_TIMED_OUT" in upper or "TIMEOUT" in upper:
+        if RZD_PROXY_SERVER:
+            return f"РЖД не ответил через российский прокси {proxy_label()} вовремя."
+        return "РЖД не ответил вовремя."
+    if "ERR_NAME_NOT_RESOLVED" in upper:
+        return "Не удалось разрешить адрес РЖД через настроенное соединение."
+    return text
 
 
 def parse_allowed_telegram_ids(raw: str | None) -> set[int]:
@@ -206,7 +257,7 @@ async def telegram_photo(path: Path, caption: str) -> None:
                     response = await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
                         data={"chat_id": chat_id, "caption": caption[:1024]},
-                        files={"photo": (path.name, image, "image/png")},
+                        files={"photo": (path.name, image, "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png")},
                     )
                 response.raise_for_status()
             except Exception as exc:
@@ -233,6 +284,7 @@ class RzdAutomation:
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
             headless=HEADLESS,
+            proxy=browser_proxy_config(),
             locale="ru-RU",
             timezone_id=APP_TIMEZONE,
             viewport={"width": 1440, "height": 1000},
@@ -265,11 +317,56 @@ class RzdAutomation:
         page.set_default_navigation_timeout(75_000)
         return page
 
-    async def screenshot(self, page: Page, name: str) -> Path:
+    async def screenshot(self, page: Page, name: str) -> Path | None:
+        """Сохраняет диагностический экран, но никогда не ломает сценарий.
+
+        Полностраничные PNG на тяжёлой странице РЖД иногда зависают дольше
+        action timeout. Сначала снимаем только видимую область в JPEG, а при
+        сбое используем CDP напрямую. Если оба способа не сработали, просто
+        продолжаем без изображения и сохраняем исходный результат операции.
+        """
         safe = re.sub(r"[^a-zA-Zа-яА-Я0-9_-]", "_", name)[:70]
-        path = SCREENSHOT_DIR / f"{utc_now().strftime('%Y%m%d_%H%M%S')}_{safe}.png"
-        await page.screenshot(path=str(path), full_page=True)
-        return path
+        path = SCREENSHOT_DIR / f"{utc_now().strftime('%Y%m%d_%H%M%S')}_{safe}.jpg"
+
+        try:
+            await page.screenshot(
+                path=str(path),
+                type="jpeg",
+                quality=65,
+                full_page=False,
+                animations="disabled",
+                caret="hide",
+                timeout=8_000,
+            )
+            return path
+        except Exception as exc:
+            logger.warning("Обычный скриншот не создан: %s", exc)
+
+        try:
+            assert self.context is not None
+            session = await self.context.new_cdp_session(page)
+            result = await asyncio.wait_for(
+                session.send(
+                    "Page.captureScreenshot",
+                    {
+                        "format": "jpeg",
+                        "quality": 55,
+                        "captureBeyondViewport": False,
+                        "fromSurface": True,
+                    },
+                ),
+                timeout=6,
+            )
+            path.write_bytes(base64.b64decode(result["data"]))
+            await session.detach()
+            return path
+        except Exception as exc:
+            logger.warning("Резервный скриншот не создан: %s", exc)
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
 
     @staticmethod
     async def visible(locator: Locator, timeout: int = 900) -> bool:
@@ -951,37 +1048,52 @@ class RzdAutomation:
 
     async def book_round_trip(self) -> tuple[str, Path | None]:
         page = await self.page()
+        stage = "открытие браузера"
         try:
             # Вход делается только при отсутствии активной сессии.
+            stage = "авторизация на РЖД"
             await self.login_once(page)
 
             # Всегда заново задаём маршрут и обе даты на www.rzd.ru. Это создаёт
             # корректный контекст заказа туда-обратно в билетном приложении.
+            stage = "заполнение маршрута и дат"
             await self.search_round_trip(page)
 
             # Туда: выбираем поезд 005Э, затем вагон 5 и место 35.
+            stage = "выбор поезда 005Э"
             await self.choose_outbound_train(page)
+            stage = "выбор вагона 5 туда"
             await self.select_wagon(page, OUTBOUND["wagon"])
+            stage = "выбор места 35 туда"
             await self.select_seat(page, OUTBOUND["seat"])
+            stage = "выбор пассажира туда"
             await self.continue_to_boarding(page, OUTBOUND_BOARDING_URL)
             await self.select_only_passenger(page)
 
             # Переходим штатной кнопкой к выбору обратного поезда. Жёсткий URL
             # используется только как запасной вариант.
+            stage = "переход к обратной поездке"
             await self.go_to_return_search(page)
 
             # Обратная поездка: 29.07, 19:40, купе.
+            stage = "выбор обратного поезда 19:40"
             await self.choose_return_train(page)
             if "/seats" not in page.url:
                 await self.goto(page, RETURN_SEATS_URL)
+            stage = "выбор вагона 7 обратно"
             await self.select_wagon(page, RETURN["wagon"])
+            stage = "выбор места 35 обратно"
             await self.select_seat(page, RETURN["seat"])
+            stage = "выбор пассажира обратно"
             await self.continue_to_boarding(page, RETURN_BOARDING_URL)
             await self.select_only_passenger(page)
 
             # Создаём заказ, но оплату не нажимаем.
+            stage = "нажатие «ОФОРМИТЬ ЗАКАЗ»"
             await self.click_order(page)
+            stage = "проверка создания заказа"
             await self.verify_order(page)
+            # Снимок является только дополнением и не влияет на статус заказа.
             shot = await self.screenshot(page, "order_created")
             return (
                 "Заказ создан: Владивосток → Хабаровск-1, 25.07 поезд 005Э, "
@@ -992,20 +1104,15 @@ class RzdAutomation:
             )
         except PlaywrightTimeoutError as exc:
             shot = await self.screenshot(page, "timeout")
-            error = RuntimeError("РЖД не ответил вовремя.")
+            error = RuntimeError(f"Этап «{stage}»: {friendly_browser_error(exc)}")
             setattr(error, "screenshot", shot)
             raise error from exc
         except Exception as exc:
-            try:
-                shot = await self.screenshot(page, "booking_error")
-            except Exception:
-                shot = None
-            # Передаём путь через атрибут, чтобы отправить скриншот в Telegram.
-            try:
-                setattr(exc, "screenshot", shot)
-            except Exception:
-                pass
-            raise
+            shot = await self.screenshot(page, "booking_error")
+            original = friendly_browser_error(exc)
+            error = RuntimeError(f"Этап «{stage}»: {original}")
+            setattr(error, "screenshot", shot)
+            raise error from exc
         finally:
             await page.close()
 
@@ -1055,6 +1162,8 @@ async def run_booking(reason: str = "scheduler") -> None:
             await telegram_text("✅ РЖД: " + message)
             if screenshot is not None:
                 await telegram_photo(screenshot, "РЖД: заказ создан, открыта стадия оплаты.")
+            else:
+                logger.warning("Заказ подтверждён, но диагностический скриншот не создан.")
         except Exception as exc:
             finished = utc_now()
             # book_round_trip сохраняет диагностический скриншот перед пробросом.
@@ -1078,6 +1187,8 @@ async def run_booking(reason: str = "scheduler") -> None:
             await telegram_text("⚠️ РЖД: " + message)
             if isinstance(screenshot, Path):
                 await telegram_photo(screenshot, "РЖД: ошибка сценария, последний экран.")
+            else:
+                logger.warning("Ошибка сценария сохранена без скриншота.")
 
 
 def is_due() -> bool:
@@ -1155,6 +1266,7 @@ def status_text() -> str:
         f"Состояние: {state}\n"
         f"Автозапуск: {'включён' if enabled else 'на паузе'}\n"
         f"Интервал: {CHECK_INTERVAL_HOURS} ч.\n"
+        f"Прокси Chromium: {proxy_label()}\n"
         f"Последний старт: {local_time(status.get('last_started_at'))}\n"
         f"Последнее завершение: {local_time(status.get('last_finished_at'))}\n"
         f"Последний успех: {local_time(status.get('last_success_at'))}\n"
@@ -1178,6 +1290,7 @@ def config_text() -> str:
         "Вагон: 07\n"
         "Место: 35\n\n"
         f"Пассажир: {PASSENGER['surname']} {PASSENGER['name']} {PASSENGER['patronymic']}\n"
+        f"Прокси для РЖД: {proxy_label()}\n"
         "Бот создаёт заказ и останавливается на стадии оплаты."
     )
 
@@ -1464,4 +1577,3 @@ async def health(background_tasks: BackgroundTasks) -> JSONResponse:
     if is_due() and not run_lock.locked():
         background_tasks.add_task(run_booking, "health wake-up")
     return JSONResponse({"ok": True, "state": status["state"]})
-
