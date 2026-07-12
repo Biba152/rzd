@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}Панель · RZD Seat Assistant{% endblock %}
+{% block content %}
+<div class="hero">
+  <div>
+    <p class="eyebrow">Автоматическая проверка раз в {{ interval }} ч.</p>
+    <h1>Места и бронирования</h1>
+    <p class="muted">
+      Автобронирование: <strong>{{ "включено" if auto_reserve else "выключено" }}</strong>.
+      После успешного выхода на оплату поездка автоматически ставится на паузу.
+    </p>
+  </div>
+  <form method="post" action="/run-all">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">Проверить всё сейчас</button>
+  </form>
+</div>
+
+<section class="grid two">
+  <article class="card">
+    <div class="card-head">
+      <h2>Сессия РЖД</h2>
+      <span class="badge {{ login_status }}">{{ login_status }}</span>
+    </div>
+    <p>{{ login_message or "Статус ещё не проверялся." }}</p>
+
+    {% if challenge_screenshot %}
+      <a href="/screenshots/{{ challenge_screenshot }}" target="_blank">
+        <img class="challenge" src="/screenshots/{{ challenge_screenshot }}" alt="Скриншот проверки">
+      </a>
+    {% endif %}
+
+    <div class="actions">
+      <form method="post" action="/rzd/login">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">Войти автоматически</button>
+      </form>
+      <form method="post" action="/rzd/status">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="secondary" type="submit">Проверить вход</button>
+      </form>
+    </div>
+
+    {% if login_status == "challenge" %}
+    <form method="post" action="/rzd/challenge" class="stack compact">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>Код/CAPTCHA
+        <input name="code" required autocomplete="one-time-code">
+      </label>
+      <button type="submit">Отправить код</button>
+    </form>
+    {% endif %}
+  </article>
+
+  <article class="card">
+    <h2>Расписание</h2>
+    <p>Следующий автоматический запуск:</p>
+    <p class="big">{{ next_run or "после старта планировщика" }}</p>
+    <p class="muted">Время показывается в ISO/UTC. Сам интервал не зависит от часового пояса.</p>
+  </article>
+</section>
+
+<section class="card">
+  <h2>Добавить поездку</h2>
+  <form method="post" action="/trips/add" class="form-grid">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Дата<input name="date" placeholder="25.07.2026" required></label>
+    <label>Откуда<input name="from_name" placeholder="Владивосток" required></label>
+    <label>Куда<input name="to_name" placeholder="Хабаровск-1" required></label>
+    <label>Поезд<input name="train" placeholder="005Э" required></label>
+    <label>Вагон<input name="wagon" placeholder="05" required></label>
+    <label>Место<input name="seat" placeholder="35" required></label>
+    <label class="wide">Готовая ссылка поиска РЖД — необязательно
+      <input name="search_url" placeholder="https://ticket.rzd.ru/searchresults/...">
+    </label>
+    <div class="wide"><button type="submit">Добавить</button></div>
+  </form>
+</section>
+
+<section>
+  <div class="section-head">
+    <h2>Поездки</h2>
+    <span class="muted">{{ trips|length }} шт.</span>
+  </div>
+  <div class="trip-list">
+    {% for trip in trips %}
+    <article class="trip-card">
+      <div class="trip-main">
+        <div class="trip-route">{{ trip["from_name"] }} → {{ trip["to_name"] }}</div>
+        <div class="trip-meta">
+          {{ trip["date"] }} · поезд {{ trip["train"] }} · вагон {{ trip["wagon"] }} · место {{ trip["seat"] }}
+        </div>
+        <div class="trip-status">
+          <span class="badge {{ trip['status'] }}">{{ trip["status"] }}</span>
+          <span>{{ trip["last_message"] or "Ещё не проверялось." }}</span>
+        </div>
+        {% if trip["last_checked_at"] %}
+          <div class="muted small">Последняя проверка: {{ trip["last_checked_at"] }}</div>
+        {% endif %}
+      </div>
+      <div class="trip-actions">
+        <form method="post" action="/trips/{{ trip['id'] }}/run">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">Проверить</button>
+        </form>
+        <form method="post" action="/trips/{{ trip['id'] }}/toggle">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="secondary" type="submit">{{ "Пауза" if trip["enabled"] else "Включить" }}</button>
+        </form>
+        <form method="post" action="/trips/{{ trip['id'] }}/delete" onsubmit="return confirm('Удалить поездку?')">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="danger" type="submit">Удалить</button>
+        </form>
+      </div>
+    </article>
+    {% else %}
+      <div class="empty">Пока нет поездок.</div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Журнал</h2>
+  <div class="log-list">
+    {% for log in logs %}
+      <div class="log-row">
+        <span class="log-time">{{ log["created_at"] }}</span>
+        <span class="badge {{ log['level']|lower }}">{{ log["level"] }}</span>
+        <span>{{ log["message"] }}</span>
+        {% if log["screenshot"] %}
+          <a href="/screenshots/{{ log['screenshot'] }}" target="_blank">скриншот</a>
+        {% endif %}
+      </div>
+    {% else %}
+      <div class="empty">Журнал пуст.</div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
