@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}RZD Seat Assistant{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">RZD Seat Assistant</a>
+    {% if request.session.get("admin") %}
+    <nav>
+      <a href="/">Панель</a>
+      <a href="/settings">Настройки</a>
+      <form action="/logout" method="post" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="link-button" type="submit">Выйти</button>
+      </form>
+    </nav>
+    {% endif %}
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
