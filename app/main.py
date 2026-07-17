@@ -34,7 +34,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-SCRIPT_VERSION = "local-fixes-v17-readable-error-reasons-2026-07-17"
+SCRIPT_VERSION = "local-fixes-v19-automatic-seat-fallback-2026-07-17"
 
 MODE_ROUND_TRIP = "round_trip"
 MODE_OUTBOUND_ONLY = "outbound_only"
@@ -44,7 +44,7 @@ BOOKING_MODE_LABELS = {
     MODE_OUTBOUND_ONLY: "только туда",
     MODE_RETURN_ONLY: "только обратно",
 }
-DEFAULT_BOOKING_MODE = MODE_OUTBOUND_ONLY
+DEFAULT_BOOKING_MODE = MODE_ROUND_TRIP
 
 # ---------------------------------------------------------------------------
 # Единственная конфигурация сервиса. Пользователей/поездки через сайт добавить
@@ -970,6 +970,16 @@ class RzdAutomation:
         await self.dismiss_popups(page)
 
     async def is_logged_in(self, page: Page) -> bool:
+        try:
+            authorized_flag = await page.evaluate(
+                "() => typeof window.userIsAuthorized !== 'undefined' "
+                "&& window.userIsAuthorized === true"
+            )
+            if authorized_flag:
+                return True
+        except Exception:
+            pass
+
         # Сначала проверяем явный гостевой контрол. На Angular-страницах в DOM
         # могут присутствовать тексты «Мои поездки» из других виджетов, поэтому
         # один такой текст ещё не доказывает, что сессия авторизована.
@@ -984,6 +994,20 @@ class RzdAutomation:
         )
         if guest is not None:
             return False
+
+        # Старый портал www.rzd.ru показывает в этом элементе «Вход» гостю и
+        # имя/логин авторизованному пользователю.
+        old_profile = page.locator(
+            'li[data-test-id="profile"] a.username span, '
+            'li[data-test-id="profile"] .username'
+        )
+        for index in range(await old_profile.count()):
+            item = old_profile.nth(index)
+            if not await self.visible(item):
+                continue
+            text = " ".join((await item.inner_text()).split())
+            if text and text.casefold() not in {"вход", "войти"}:
+                return True
 
         # Не считаем обычную иконку профиля признаком входа: она присутствует и
         # у гостя. Проверяем только точные элементы авторизованного меню.
@@ -1005,70 +1029,125 @@ class RzdAutomation:
         # не делаем.
         if "rzd.ru" not in page.url.lower():
             await page.goto(PORTAL_HOME, wait_until="domcontentloaded")
-        await self.wait_app(page, 3000)
+        await self.wait_app(page, 5500)
         if await self.is_logged_in(page):
             return
 
-        clicked = await self.click_first(
-            [
-                page.get_by_role("button", name=re.compile(r"^Войти$", re.I)),
-                page.get_by_role("link", name=re.compile(r"^Войти$", re.I)),
-                page.get_by_text(re.compile(r"^Войти$", re.I), exact=True),
-                page.locator('[data-test-id="profile"], .j-login'),
-            ]
-        )
-        if not clicked:
-            raise RuntimeError("Не найдена кнопка входа РЖД.")
-        await page.wait_for_timeout(1800)
-        await self.save_dom(page, "login_form")
+        auth_page: Page | None = None
+        auth_form: Locator | None = None
+        deadline = asyncio.get_running_loop().time() + 20
+        attempts = 0
+        while asyncio.get_running_loop().time() < deadline and auth_form is None:
+            # На старом портале обработчик j-auth-open подключается асинхронно.
+            # Повторяем клик, если первый произошёл до загрузки JavaScript.
+            if attempts == 0 or attempts % 3 == 0:
+                openers: list[Locator] = []
+                for frame in page.frames:
+                    openers.extend(
+                        [
+                            frame.locator(
+                                'li.j-login[data-test-id="profile"] a.j-auth-open'
+                            ),
+                            frame.locator('a.j-auth-open.username'),
+                            frame.get_by_role(
+                                "button", name=re.compile(r"^\s*Войти\s*$", re.I)
+                            ),
+                            frame.get_by_role(
+                                "link", name=re.compile(r"^\s*(Войти|Вход)\s*$", re.I)
+                            ),
+                        ]
+                    )
+                await self.click_first(openers)
+                await page.wait_for_timeout(1200)
 
-        login_ok = await self.fill_first(
-            [
-                page.get_by_label(re.compile(r"Логин|Телефон|E-mail|Почта", re.I)),
-                page.locator(
-                    'input[name="j_username"], input[name*="login" i], '
-                    'input[name*="username" i], input[type="email"], input[type="tel"]'
-                ),
-            ],
-            RZD_LOGIN,
-        )
-        password_ok = await self.fill_first(
-            [
-                page.get_by_label(re.compile(r"Пароль", re.I)),
-                page.locator('input[name="j_password"], input[type="password"]'),
-            ],
-            RZD_PASSWORD,
-        )
-        if not login_ok or not password_ok:
-            raise RuntimeError("Не найдены поля логина/пароля РЖД.")
+            candidate_pages = (
+                list(reversed(self.context.pages)) if self.context is not None else [page]
+            )
+            for candidate_page in candidate_pages:
+                if candidate_page.is_closed():
+                    continue
+                for frame in candidate_page.frames:
+                    form = frame.locator("form.j-form-auth")
+                    visible_form = await self.first_visible([form])
+                    if visible_form is not None:
+                        auth_page = candidate_page
+                        auth_form = visible_form
+                        break
+                if auth_form is not None:
+                    break
+            attempts += 1
+            if auth_form is None:
+                await page.wait_for_timeout(900)
+
+        if auth_page is None or auth_form is None:
+            await self.save_dom(page, "login_form_not_opened")
+            raise RuntimeError(
+                "Форма входа РЖД не открылась за 20 секунд. "
+                "Страница портала загрузилась, но кнопка входа не активировала форму."
+            )
+
+        await self.save_dom(auth_page, "login_form")
+        username = auth_form.locator('input[name="j_username"]')
+        password = auth_form.locator('input[name="j_password"]')
+        if not await self.fill_first([username], RZD_LOGIN) or not await self.fill_first(
+            [password], RZD_PASSWORD
+        ):
+            raise RuntimeError("В форме РЖД не найдены поля j_username/j_password.")
 
         if not await self.click_first(
-            [
-                page.get_by_role("button", name=re.compile(r"Войти|Продолжить", re.I)),
-                page.locator('button[type="submit"]'),
-            ]
+            [auth_form.locator('button[type="submit"]').filter(has_text=re.compile(r"Войти", re.I))]
         ):
-            raise RuntimeError("Не найдена кнопка подтверждения входа.")
+            raise RuntimeError("В форме РЖД не найдена кнопка подтверждения входа.")
 
-        await page.wait_for_timeout(4500)
-        if await self.is_logged_in(page):
-            logger.info("Авторизация в аккаунте РЖД подтверждена интерфейсом сайта.")
-            return
+        confirmation_deadline = asyncio.get_running_loop().time() + 20
+        while asyncio.get_running_loop().time() < confirmation_deadline:
+            candidate_pages = (
+                list(reversed(self.context.pages)) if self.context is not None else [page]
+            )
+            for candidate_page in candidate_pages:
+                if not candidate_page.is_closed() and await self.is_logged_in(candidate_page):
+                    logger.info(
+                        "Авторизация в аккаунте РЖД подтверждена интерфейсом сайта."
+                    )
+                    return
 
-        await self.save_dom(page, "login_not_confirmed")
+            if not auth_page.is_closed():
+                error = await self.first_visible(
+                    [
+                        auth_page.locator("form.j-form-auth .auth-error"),
+                        auth_page.locator(".j-form-auth .auth-error-text"),
+                    ]
+                )
+                if error is not None:
+                    text = " ".join((await error.inner_text()).split())
+                    if text and text.casefold() != "empty error":
+                        raise RuntimeError(f"РЖД отклонил вход: {text}")
 
-        challenge = await self.first_visible(
-            [
-                page.get_by_label(re.compile(r"Код|Captcha|Капча|SMS", re.I)),
-                page.locator(
-                    'input[name*="captcha" i], input[placeholder*="код" i], '
-                    'input[name*="code" i]'
-                ),
-            ]
+                challenge = await self.first_visible(
+                    [
+                        auth_page.locator(
+                            'form.j-form-auth input[name="_CAPTCHA_VALUE"]'
+                        ),
+                        auth_page.get_by_label(
+                            re.compile(r"Защитный код|Captcha|Капча|SMS", re.I)
+                        ),
+                    ]
+                )
+                if challenge is not None:
+                    raise RuntimeError("РЖД запросил CAPTCHA или код подтверждения.")
+            await page.wait_for_timeout(1000)
+
+        if not auth_page.is_closed():
+            await self.save_dom(auth_page, "login_not_confirmed")
+            login_shot = await self.screenshot(auth_page, "login_not_confirmed")
+        else:
+            login_shot = await self.screenshot(page, "login_not_confirmed")
+        error = RuntimeError(
+            "РЖД не подтвердил авторизацию за 20 секунд: форма была отправлена, "
+            "но интерфейс остался гостевым."
         )
-        if challenge is not None:
-            raise RuntimeError("РЖД запросил CAPTCHA или код подтверждения.")
-        raise RuntimeError("РЖД не подтвердил авторизацию.")
+        setattr(error, "screenshot", login_shot)
+        raise error
 
     async def goto(self, page: Page, url: str, delay_ms: int = 4500) -> None:
         await page.goto(url, wait_until="domcontentloaded")
@@ -2222,7 +2301,8 @@ class RzdAutomation:
                 shot,
             )
         except PlaywrightTimeoutError as exc:
-            shot = (
+            original_shot = getattr(exc, "screenshot", None)
+            shot = original_shot if isinstance(original_shot, Path) else (
                 await self.screenshot(page, "timeout")
                 if page is not None and not page.is_closed()
                 else None
@@ -2233,7 +2313,8 @@ class RzdAutomation:
             setattr(error, "screenshot", shot)
             raise error from exc
         except Exception as exc:
-            shot = (
+            original_shot = getattr(exc, "screenshot", None)
+            shot = original_shot if isinstance(original_shot, Path) else (
                 await self.screenshot(page, "booking_error")
                 if page is not None and not page.is_closed()
                 else None
@@ -2320,7 +2401,36 @@ def booking_failure_report(message: str, mode: str) -> tuple[str, str]:
     return report, reason
 
 
-async def run_booking(reason: str = "scheduler") -> None:
+def automatic_fallback_mode(message: str, attempted_mode: str) -> str | None:
+    """Выбирает одиночный маршрут только при недоступности конкретного места."""
+    if attempted_mode != MODE_ROUND_TRIP:
+        return None
+
+    stage, _reason, detail = booking_failure_details(message)
+    lowered_stage = stage.casefold()
+    lowered_detail = detail.casefold()
+    seat_is_unavailable = (
+        "мест" in lowered_detail
+        and any(
+            marker in lowered_detail
+            for marker in (
+                "недоступ",
+                "занят",
+                "уже выбрано",
+                "не найден в схеме вагона",
+            )
+        )
+    )
+    if not seat_is_unavailable or "выбор места" not in lowered_stage:
+        return None
+    if "туда" in lowered_stage:
+        return MODE_RETURN_ONLY
+    if "обратно" in lowered_stage:
+        return MODE_OUTBOUND_ONLY
+    return None
+
+
+async def run_booking(reason: str = "scheduler", automated: bool = True) -> None:
     global status
     if service is None:
         return
@@ -2329,7 +2439,9 @@ async def run_booking(reason: str = "scheduler") -> None:
         return
 
     async with run_lock:
-        active_mode = booking_mode
+        # Планировщик и wake-up проверки всегда сначала пытаются оформить оба
+        # сегмента. /mode остаётся выбором для ручного запуска через /run.
+        active_mode = MODE_ROUND_TRIP if automated else booking_mode
         started = utc_now()
         status.update(
             {
@@ -2352,8 +2464,41 @@ async def run_booking(reason: str = "scheduler") -> None:
         )
 
         screenshot: Path | None = None
+        fallback_note: str | None = None
         try:
-            message, screenshot = await service.book_trip(active_mode)
+            while True:
+                try:
+                    message, screenshot = await service.book_trip(active_mode)
+                    break
+                except Exception as exc:
+                    fallback_mode = (
+                        automatic_fallback_mode(str(exc), active_mode)
+                        if automated
+                        else None
+                    )
+                    if fallback_mode is None:
+                        raise
+
+                    failed_stage, readable_reason, _detail = booking_failure_details(
+                        str(exc)
+                    )
+                    fallback_note = (
+                        f"В режиме туда-обратно этап «{failed_stage}» остановлен: "
+                        f"{readable_reason} Переключение на режим "
+                        f"«{BOOKING_MODE_LABELS[fallback_mode]}»."
+                    )
+                    logger.warning(fallback_note)
+                    await telegram_text("↪️ РЖД: " + fallback_note)
+                    active_mode = fallback_mode
+                    status.update(
+                        {
+                            "message": fallback_note,
+                            "booking_mode": active_mode,
+                        }
+                    )
+
+            if fallback_note is not None:
+                message = f"{fallback_note} {message}"
             finished = utc_now()
             status.update(
                 {
@@ -2506,11 +2651,14 @@ def status_text() -> str:
     }
     enabled = bool(status.get("automation_enabled", True))
     state = state_labels.get(str(status.get("state")), str(status.get("state")))
+    active_mode = normalize_booking_mode(str(status.get("booking_mode", booking_mode)))
     return (
         "📊 Статус РЖД-бота\n\n"
         f"Версия: {SCRIPT_VERSION}\n"
         f"Состояние: {state}\n"
-        f"Режим: {BOOKING_MODE_LABELS[booking_mode]}\n"
+        f"Текущий/последний режим: {BOOKING_MODE_LABELS[active_mode]}\n"
+        f"Ручной режим /run: {BOOKING_MODE_LABELS[booking_mode]}\n"
+        "Автоматический старт: туда-обратно\n"
         f"Автозапуск: {'включён' if enabled else 'на паузе'}\n"
         f"Интервал: {CHECK_INTERVAL_HOURS} ч.\n"
         f"Прокси Chromium: {proxy_label()}\n"
@@ -2526,7 +2674,9 @@ def config_text() -> str:
     return (
         "🧾 Фиксированный заказ\n\n"
         f"Версия: {SCRIPT_VERSION}\n"
-        f"Активный режим: {BOOKING_MODE_LABELS[booking_mode]}\n\n"
+        "Автоматический режим: сначала туда-обратно; при занятом месте "
+        "туда — только обратно, при занятом месте обратно — только туда.\n"
+        f"Ручной режим /run: {BOOKING_MODE_LABELS[booking_mode]}\n\n"
         "Туда: Владивосток → Хабаровск-1\n"
         "Дата: 25.07.2026\n"
         f"Поезд: {OUTBOUND['train']}\n"
@@ -2625,8 +2775,9 @@ async def bot_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if requested is None:
         text = (
-            "🚦 Выберите режим бронирования\n\n"
-            f"Сейчас выбран: {BOOKING_MODE_LABELS[booking_mode]}."
+            "🚦 Выберите режим ручного запуска /run\n\n"
+            f"Сейчас выбран: {BOOKING_MODE_LABELS[booking_mode]}.\n"
+            "Автоматические итерации всегда начинаются с режима туда-обратно."
         )
         if update.callback_query is not None:
             query = update.callback_query
@@ -2648,8 +2799,8 @@ async def bot_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     set_booking_mode(requested)
     text = (
-        f"✅ Выбран режим: {BOOKING_MODE_LABELS[booking_mode]}.\n\n"
-        "Следующие автоматические и ручные запуски используют этот режим."
+        f"✅ Для ручного /run выбран режим: {BOOKING_MODE_LABELS[booking_mode]}.\n\n"
+        "Автоматические итерации по-прежнему начинаются с режима туда-обратно."
     )
     query = update.callback_query
     if query is not None:
@@ -2668,7 +2819,7 @@ async def bot_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if run_lock.locked():
         await send_menu(update, "⏳ Оформление уже выполняется. Второй запуск не создан.")
         return
-    asyncio.create_task(run_booking("Telegram /run"))
+    asyncio.create_task(run_booking("Telegram /run", automated=False))
     await send_menu(update, "🚆 Ручной запуск принят. Результат и скриншот придут отдельным сообщением.")
 
 
